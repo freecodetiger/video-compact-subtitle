@@ -16,7 +16,9 @@ Compact a video by removing all silences and filler words, then generate and bur
 
 - `ffmpeg` and `ffprobe` installed
 - `faster-whisper` Python package (`pip install faster-whisper`)
-- DashScope API key (optional, for Paraformer ASR)
+- `anthropic` Python package (`pip install anthropic`)
+- 在 Claude Code 会话中运行时，API 凭据自动复用，无需额外配置
+- 独立运行时需设置 `ANTHROPIC_API_KEY` 环境变量
 
 ## Workflow Overview
 
@@ -114,10 +116,21 @@ Key parameters:
 
 Send the transcript to Claude API in batches of ~20 segments for intelligent correction. Process is automatic — no human confirmation needed.
 
+**API 复用：** 自动检测当前 Claude Code 会话的环境变量，无需额外配置 API Key：
+
 ```python
+import os
 import anthropic
 
-client = anthropic.Anthropic()
+# 自动复用 Claude Code 会话的凭据
+# 优先级: ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN
+api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+base_url = os.environ.get("ANTHROPIC_BASE_URL")  # 自动继承，如 token-plan-cn
+
+client = anthropic.Anthropic(
+    api_key=api_key,
+    base_url=base_url,
+)
 
 SYSTEM_PROMPT = """你是字幕修正助手。请修正以下字幕中的问题：
 
@@ -144,7 +157,7 @@ def fix_transcript(segments, batch_size=20):
         input_text = "\n".join(lines)
 
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
             max_tokens=4096,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": input_text}]
@@ -164,7 +177,7 @@ def fix_transcript(segments, batch_size=20):
     return fixed
 ```
 
-Use `claude-haiku-4-5-20251001` for speed and cost efficiency — it's sufficient for text correction tasks. The pipeline will automatically detect the `ANTHROPIC_API_KEY` environment variable.
+模型选择：优先使用 `ANTHROPIC_MODEL` 环境变量，回退到 `claude-haiku-4-5-20251001`。在 Claude Code 会话中运行时，会自动继承当前会话的 API 凭据和模型配置。
 
 ## Step 8: Generate SRT Subtitles
 
