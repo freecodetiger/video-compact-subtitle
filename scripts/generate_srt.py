@@ -25,6 +25,16 @@ DEFAULT_FIXES = [
     ["FindSkills", "find skill"],
     ["AskAgainForSkills", "don't ask again for skill"],
     ["Dangerously-Scape-Permissions", "dangerously-skip-permissions"],
+    ["出金率", "出现率"],
+    ["夯报了", "夯爆了"],
+    ["夯报", "夯爆"],
+    ["土龙树", "图灵树"],
+    ["鸡蛋机", "计算机"],
+    ["浅严", "前沿"],
+    ["分布室", "分布式"],
+    ["调单学生", "刁难学生"],
+    ["Vab", "Web"],
+    ["拉丸", "拉完"],
 ]
 
 FILLERS = ["嗯","啊","呃","额","哦","噢","哎","唉","哈","呵","呢","吧","呀","嘛","喂","嗨","嘿","哇"]
@@ -46,19 +56,44 @@ def filter_fillers(text):
     t = re.sub(r'[，、\s]+$', '', t)
     return t.strip()
 
+MAX_CHARS = 28  # 每条字幕最大字数
+
 def split_to_chunks(text):
-    """Split by commas/periods, merge every 2 clauses."""
-    parts = [s for s in re.split(r'(?<=[，。？！])', text) if s.strip()]
+    """语义切分：按。？！切大段，内按，、切小段，兜底硬切。"""
+    # 先按句号切大段
+    big_parts = re.split(r'(?<=[。？！])', text)
     chunks = []
-    i = 0
-    while i < len(parts):
-        if i + 1 < len(parts):
-            chunks.append((parts[i] + parts[i+1]).strip())
-            i += 2
+    for part in big_parts:
+        part = part.strip()
+        if not part:
+            continue
+        if len(part) <= MAX_CHARS:
+            chunks.append(part)
+            continue
+        # 大段内按逗号切
+        clauses = re.split(r'(?<=[，、])', part)
+        current = ""
+        for c in clauses:
+            c = c.strip()
+            if not c:
+                continue
+            if len(current) + len(c) <= MAX_CHARS:
+                current += c
+            else:
+                if current:
+                    chunks.append(current)
+                current = c
+        if current:
+            chunks.append(current)
+    # 兜底硬切
+    result = []
+    for c in chunks:
+        if len(c) > MAX_CHARS:
+            for i in range(0, len(c), MAX_CHARS):
+                result.append(c[i:i+MAX_CHARS])
         else:
-            chunks.append(parts[i].strip())
-            i += 1
-    return [c for c in chunks if c]
+            result.append(c)
+    return [c for c in result if c]
 
 def format_srt_time(seconds):
     h = int(seconds // 3600)
@@ -147,6 +182,17 @@ def generate_from_whisper_words(data, fixes):
 
             entries.append({"begin": chunk_begin, "end": chunk_end, "text": chunk})
             pos = chunk_end_in_text
+
+    # 无间隔衔接：每条结束时间 = 下一条开始时间
+    for i in range(len(entries) - 1):
+        entries[i]["end"] = entries[i + 1]["begin"]
+    # 最后一条加 200ms 缓冲
+    if entries:
+        entries[-1]["end"] += 0.2
+    # 最小显示时间 0.25s
+    for e in entries:
+        if e["end"] - e["begin"] < 0.25:
+            e["end"] = e["begin"] + 0.25
 
     return entries
 

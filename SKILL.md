@@ -165,34 +165,77 @@ Key parameters:
 
 ## Step 8: Generate SRT Subtitles
 
-Split long sentences into display-friendly chunks:
+### 8a. 重新转录（如果视频被裁剪过）
 
-**Rules:**
-- Split by commas (，) and periods (。)
-- Merge every 2 clauses into one subtitle entry
-- Distribute time proportionally by character count
-- Max ~20-25 characters per subtitle line
+> **关键：** 如果 compacted.mp4 被裁剪过（如去掉开头），必须重新转录，不能沿用旧的 raw_segments，否则时间轴全部错位。
 
-```javascript
-function splitToChunks(text) {
-  const parts = text.split(/(?<=[，。？！])/g).filter(s => s.trim());
-  const chunks = [];
-  for (let i = 0; i < parts.length; i += 2) {
-    chunks.push((parts[i] + (parts[i+1] || '')).trim());
-  }
-  return chunks.filter(s => s.length > 0);
-}
+```python
+# 裁剪后重新转录
+ffmpeg -y -ss TRIM_START -i compacted.mp4 -c copy compacted_final.mp4
+
+model = WhisperModel("medium", device="cpu", compute_type="int8")
+segments, info = model.transcribe("compacted_final.mp4", ...)
+```
+
+### 8b. 语义切分 + 无间隔衔接
+
+**切分规则（按优先级）：**
+1. 按句号（。？！）切大段
+2. 大段内按逗号（，、）切小段
+3. 仍有超长段则按字数硬切兜底
+4. 每条字幕 ≤ 28 字（约两行半）
+
+**时间规则：**
+- 起始时间 = Whisper 词级时间戳对齐
+- **结束时间 = 下一条字幕的起始时间**（无间隔，说话人不停字幕不停）
+- 最后一条加 200ms 缓冲
+- 最小显示时间 0.25s
+
+```python
+def semantic_split(text, max_chars=28):
+    """按语义标点切分，保持完整语义单位。"""
+    # 先按句号切大段
+    big_parts = re.split(r'(?<=[。？！])', text)
+    chunks = []
+    for part in big_parts:
+        part = part.strip()
+        if not part:
+            continue
+        if len(part) <= max_chars:
+            chunks.append(part)
+            continue
+        # 大段内按逗号切
+        clauses = re.split(r'(?<=[，、])', part)
+        current = ""
+        for c in clauses:
+            c = c.strip()
+            if not c:
+                continue
+            if len(current) + len(c) <= max_chars:
+                current += c
+            else:
+                if current:
+                    chunks.append(current)
+                current = c
+        if current:
+            chunks.append(current)
+    return chunks
+
+# 生成条目后，无间隔衔接
+for i in range(len(entries) - 1):
+    entries[i]["end"] = entries[i + 1]["start"]  # 紧接下一条
+entries[-1]["end"] += 0.2  # 最后一条加缓冲
 ```
 
 SRT format:
 ```
 1
-00:00:00,000 --> 00:00:04,500
-第一句字幕文字
+00:00:00,000 --> 00:00:02,879
+从夯到拉评价计算机专业课
 
 2
-00:00:04,500 --> 00:00:08,200
-第二句字幕文字
+00:00:02,879 --> 00:00:06,160
+我整理的一些出现率比较高的专业课程
 ```
 
 ## Step 9: Burn Subtitles
@@ -243,7 +286,9 @@ The pipeline uses **Whisper word-level timestamps** for precise subtitle timing:
 
 - **Choppy audio after concat**: Increase merge gap to 200-300ms
 - **ASR misrecognizes terms**: Step 7 会根据上下文自动修正；也可手动编辑 `subtitles.srt` 后重新烧录
-- **Subtitle timing drift**: Re-transcribe compacted video (don't map from original)
+- **Subtitle timing drift**: 裁剪视频后必须重新转录（Step 8a），不能沿用旧的 raw_segments
+- **字幕有间隔/话没说完字幕就消失**: 用无间隔衔接（`entries[i]["end"] = entries[i+1]["start"]`），不要用单词的 end 时间
+- **字幕堆积超过两行**: 用语义切分（按。？！→，、层级），限制每条 ≤28 字
 - **ffmpeg select expression too long**: Use segment concat approach instead
 - **Slow filler detection**: Ensure Step 3 uses `tiny` model, not `medium`
 - **silencedetect 输出截断**: 不要用 `grep` 管道，改用 `2>file.txt` 写入文件再 Python 解析
