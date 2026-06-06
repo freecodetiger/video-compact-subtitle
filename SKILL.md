@@ -22,14 +22,10 @@ ffmpeg -version && ffprobe -version
 
 # 2. Python 包（缺少哪个 pip install 哪个）
 python3 -c "from faster_whisper import WhisperModel; print('faster-whisper OK')"
-python3 -c "import anthropic; print('anthropic OK')"
 ```
 
 - `ffmpeg` and `ffprobe` installed
 - `faster-whisper` Python package (`pip install faster-whisper`)
-- `anthropic` Python package (`pip install anthropic`)
-- 在 Claude Code 会话中运行时，API 凭据自动复用，无需额外配置
-- 独立运行时需设置 `ANTHROPIC_API_KEY` 环境变量
 
 ## Workflow Overview
 
@@ -138,89 +134,34 @@ Key parameters:
 - `word_timestamps=True`: Get precise word-level timing
 - `vad_filter=True`: Skip remaining silences
 
-## Step 7: Fix Technical Terms (via Claude API)
+## Step 7: Fix Transcript (Claude 直接修正，无需 API)
 
-Send the transcript to Claude API in batches of ~20 segments for intelligent correction. Process is automatic — no human confirmation needed.
+> **核心变更：** 不再调用外部 LLM API。由当前 Claude Code 会话直接读取 `raw_segments.json`，根据会话上下文（视频主题、涉及的技术领域、用户提到的术语等）修正转录文本，然后写回文件。
 
-**API 复用：** 自动检测当前 Claude Code 会话的环境变量，无需额外配置 API Key。
+执行流程：
 
-**模型名兼容性警告：** `ANTHROPIC_MODEL` 环境变量可能包含代理特有的后缀（如 `mimo-v2.5-pro[1m]`），方括号会导致 API 400 错误。**必须先做探测调用**确认模型可用，不可直接使用环境变量原始值。
+1. **读取** `compact_work/raw_segments.json`
+2. **根据上下文修正** 每段文本，修正规则：
+   - 语音识别错误的技术名词（如 Claw Code→Claude Code, DeepSig→DeepSeek）
+   - 不通顺的口语表达，改为自然书面语
+   - 残留的填充词（嗯、啊、呃等）
+   - 根据视频主题推断的领域术语（如 "夯到拉" 是评分体系：夯=高、到=中、拉=低）
+3. **写回** 修正后的 JSON 到同一文件（保持 timestamps 不变）
+4. 继续 Step 8 生成 SRT
 
-```python
-import os, re, anthropic
+**示例修正（实际执行时根据视频内容判断）：**
 
-api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-base_url = os.environ.get("ANTHROPIC_BASE_URL")
-
-client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
-
-# ── 模型探测：按优先级逐个尝试 ──
-def resolve_model(client):
-    """探测可用模型，返回第一个能用的。"""
-    env_model = os.environ.get("ANTHROPIC_MODEL", "")
-    # 从环境变量模型名中去掉方括号后缀（如 mimo-v2.5-pro[1m] → mimo-v2.5-pro）
-    cleaned = re.sub(r'\[.*?\]', '', env_model).strip() if env_model else ""
-    candidates = [cleaned, "claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"]
-    candidates = [m for m in candidates if m]  # 去空
-    for model in candidates:
-        try:
-            client.messages.create(model=model, max_tokens=10,
-                                   messages=[{"role": "user", "content": "hi"}])
-            print(f"  Using model: {model}")
-            return model
-        except Exception:
-            continue
-    return None  # 全部失败
-
-model_name = resolve_model(client)
-if not model_name:
-    print("⚠️  API 不可用，跳过文本修正。请手动检查 subtitles.srt 后重新烧录。")
-    # 直接用 raw transcript 生成 SRT，跳过本步骤
-
-SYSTEM_PROMPT = """你是字幕修正助手。请修正以下字幕中的问题：
-
-1. 技术名词错误：如 Claw Code→Claude Code, DeepSig→DeepSeek, Ancetropic→Anthropic
-2. 不通顺的表达：让文字更自然流畅
-3. 过滤残留的填充词（嗯、啊、呃等）
-
-规则：
-- 不要改变语义，只修正明显的错误
-- 不要添加原文没有的内容
-- 不要改变时间戳，只输出修正后的文本
-- 保持原始的段落结构（每段之间用空行分隔）
-- 输出格式：每段一行，保持原来的顺序，不要加编号"""
-
-def fix_transcript(segments, batch_size=20):
-    """Send transcript to Claude API in batches for correction."""
-    if not model_name:
-        return segments  # 降级：返回原始文本
-
-    fixed = []
-    for i in range(0, len(segments), batch_size):
-        batch = segments[i:i+batch_size]
-        lines = [f"[{i+j+1}] {seg['text']}" for j, seg in enumerate(batch)]
-        input_text = "\n".join(lines)
-
-        try:
-            response = client.messages.create(
-                model=model_name, max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": input_text}]
-            )
-            result = response.content[0].text.strip().split("\n")
-            for k, seg in enumerate(batch):
-                if k < len(result):
-                    corrected = result[k].strip()
-                    corrected = re.sub(r'^\[\d+\]\s*', '', corrected)
-                    corrected = re.sub(r'^\d+\.\s*', '', corrected)
-                    if corrected:
-                        seg['text'] = corrected
-        except Exception as e:
-            print(f"  ⚠️  Batch {i//batch_size+1} failed: {e}")
-        fixed.extend(batch)
-
-    return fixed
 ```
+"出金率比较高" → "出现率比较高"        # 语音识别错误
+"得个假"       → "得声明一下"          # 语音识别错误
+"夯报了"       → "夯爆了"              # 口语缩读
+"上下线"       → "上限和下限"          # 语音识别错误
+"鸡蛋机"       → "计算机"              # 语音识别错误
+"黄历和奔县"   → "理论和实践"          # 语音识别错误
+"文法地归"     → "文法递归"            # 语音识别错误
+```
+
+> **优势：** 零依赖（不需要 anthropic 包）、零延迟（无需 API 调用）、上下文感知（能利用视频主题和用户描述做更准确的推断）。
 
 ## Step 8: Generate SRT Subtitles
 
@@ -301,10 +242,8 @@ The pipeline uses **Whisper word-level timestamps** for precise subtitle timing:
 ## Common Issues
 
 - **Choppy audio after concat**: Increase merge gap to 200-300ms
-- **ASR misrecognizes terms**: Add to `initial_prompt` and rely on Claude API post-correction (Step 7)
+- **ASR misrecognizes terms**: Step 7 会根据上下文自动修正；也可手动编辑 `subtitles.srt` 后重新烧录
 - **Subtitle timing drift**: Re-transcribe compacted video (don't map from original)
 - **ffmpeg select expression too long**: Use segment concat approach instead
 - **Slow filler detection**: Ensure Step 3 uses `tiny` model, not `medium`
-- **API 400 "Not supported model"**: 代理不支持标准 Claude 模型名。检查 `ANTHROPIC_MODEL` 是否含方括号后缀（如 `[1m]`），去掉后重试；或用 `resolve_model()` 探测
 - **silencedetect 输出截断**: 不要用 `grep` 管道，改用 `2>file.txt` 写入文件再 Python 解析
-- **anthropic 包未安装**: 运行前先 `python3 -c "import anthropic"` 验证，缺则 `pip install anthropic`

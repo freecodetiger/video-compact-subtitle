@@ -7,7 +7,6 @@ Usage: python run_pipeline.py INPUT.mp4 [--output OUTPUT.mp4] [--language zh] [-
 import subprocess
 import json
 import os
-import re
 import sys
 import argparse
 import tempfile
@@ -15,34 +14,6 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 
-
-def resolve_model():
-    """探测可用 API 模型，返回第一个能用的，或 None。"""
-    try:
-        import anthropic
-    except ImportError:
-        print("⚠️  anthropic 未安装，跳过 API 文本修正", file=sys.stderr)
-        return None
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    base_url = os.environ.get("ANTHROPIC_BASE_URL")
-    if not api_key:
-        return None
-
-    client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
-    env_model = os.environ.get("ANTHROPIC_MODEL", "")
-    cleaned = re.sub(r'\[.*?\]', '', env_model).strip() if env_model else ""
-    candidates = [m for m in [cleaned, "claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"] if m]
-    for model in candidates:
-        try:
-            client.messages.create(model=model, max_tokens=10,
-                                   messages=[{"role": "user", "content": "hi"}])
-            print(f"  API model: {model}", file=sys.stderr)
-            return model
-        except Exception:
-            continue
-    print("⚠️  API 模型不可用，跳过文本修正", file=sys.stderr)
-    return None
 
 def run_step(name, cmd, **kwargs):
     print(f"\n{'='*50}", file=sys.stderr)
@@ -164,53 +135,16 @@ print(f"Segments: {{len(result['segments'])}}")
 """
         ], capture_output=True)
 
-        # Step 6: Fix transcript with API (optional, degrades gracefully)
-        model_name = resolve_model()
-        if model_name:
-            print("\nFixing transcript with API...", file=sys.stderr)
-            try:
-                import anthropic
-                client = anthropic.Anthropic(
-                    api_key=os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"),
-                    base_url=os.environ.get("ANTHROPIC_BASE_URL"),
-                )
-                with open(whisper_json) as f:
-                    whisper_data = json.load(f)
-                segs = whisper_data["segments"]
-                system = """你是字幕修正助手。修正技术名词错误、不通顺表达、残留填充词。
-不要改变语义，不要添加内容，不要改变时间戳。每段一行，保持原顺序，不要加编号。"""
-                batch_size = 20
-                for i in range(0, len(segs), batch_size):
-                    batch = segs[i:i+batch_size]
-                    lines = [f"[{i+j+1}] {s['text']}" for j, s in enumerate(batch)]
-                    try:
-                        resp = client.messages.create(
-                            model=model_name, max_tokens=4096, system=system,
-                            messages=[{"role": "user", "content": "\n".join(lines)}]
-                        )
-                        result = resp.content[0].text.strip().split("\n")
-                        for k, s in enumerate(batch):
-                            if k < len(result):
-                                corrected = re.sub(r'^\[\d+\]\s*', '', result[k].strip())
-                                corrected = re.sub(r'^\d+\.\s*', '', corrected)
-                                if corrected:
-                                    s['text'] = corrected
-                    except Exception as e:
-                        print(f"  ⚠️  Batch {i//batch_size+1} failed: {e}", file=sys.stderr)
-                with open(whisper_json, "w") as f:
-                    json.dump(whisper_data, f, ensure_ascii=False, indent=2)
-                print(f"  Fixed {len(segs)} segments", file=sys.stderr)
-            except Exception as e:
-                print(f"  ⚠️  API fix skipped: {e}", file=sys.stderr)
-
-        # Step 7: Generate SRT (using word-level timestamps for precision)
+        # Step 6: Generate SRT (using word-level timestamps for precision)
+        # 注意：通过 Claude Code 会话运行时，Step 7 (文本修正) 由 Claude 直接完成
+        # 独立运行时，转录文本未经修正，可手动编辑 subtitles.srt 后重新烧录
         run_step("Generate SRT", [
             sys.executable, str(SCRIPT_DIR / "generate_srt.py"),
             str(whisper_json), str(srt_file),
             "--source", "whisper",
         ])
 
-        # Step 8: Burn subtitles
+        # Step 7: Burn subtitles
         run_step("Burn Subtitles", [
             sys.executable, str(SCRIPT_DIR / "burn_subtitles.py"),
             str(compacted), str(srt_file), str(output_path),
