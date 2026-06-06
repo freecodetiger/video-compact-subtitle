@@ -7,12 +7,42 @@ Usage: python run_pipeline.py INPUT.mp4 [--output OUTPUT.mp4] [--language zh] [-
 import subprocess
 import json
 import os
+import re
 import sys
 import argparse
 import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
+
+
+def resolve_model():
+    """探测可用 API 模型，返回第一个能用的，或 None。"""
+    try:
+        import anthropic
+    except ImportError:
+        print("⚠️  anthropic 未安装，跳过 API 文本修正", file=sys.stderr)
+        return None
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+    if not api_key:
+        return None
+
+    client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
+    env_model = os.environ.get("ANTHROPIC_MODEL", "")
+    cleaned = re.sub(r'\[.*?\]', '', env_model).strip() if env_model else ""
+    candidates = [m for m in [cleaned, "claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"] if m]
+    for model in candidates:
+        try:
+            client.messages.create(model=model, max_tokens=10,
+                                   messages=[{"role": "user", "content": "hi"}])
+            print(f"  API model: {model}", file=sys.stderr)
+            return model
+        except Exception:
+            continue
+    print("⚠️  API 模型不可用，跳过文本修正", file=sys.stderr)
+    return None
 
 def run_step(name, cmd, **kwargs):
     print(f"\n{'='*50}", file=sys.stderr)
@@ -40,14 +70,15 @@ def main():
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
-    work_dir = input_path.parent
-    output_path = Path(args.output).resolve() if args.output else work_dir / f"{input_path.stem}_compact.mp4"
+    work_dir = input_path.parent / "compact_work"
+    work_dir.mkdir(exist_ok=True)
+    output_path = Path(args.output).resolve() if args.output else input_path.parent / f"{input_path.stem}_压缩字幕.mp4"
 
     # Temp files
-    audio_wav = work_dir / "_audio.wav"
-    compacted = Path(args.compacted).resolve() if args.compacted else work_dir / "_compacted.mp4"
-    whisper_json = work_dir / "_whisper_result.json"
-    srt_file = work_dir / "_subtitles.srt"
+    audio_wav = work_dir / "audio.wav"
+    compacted = Path(args.compacted).resolve() if args.compacted else work_dir / "compacted.mp4"
+    whisper_json = work_dir / "whisper_result.json"
+    srt_file = input_path.parent / "subtitles.srt"  # SRT 保留在输入目录方便用户查看
 
     try:
         # Step 1: Extract audio
@@ -66,29 +97,29 @@ def main():
             silences = json.loads(result.stdout)
             print(f"Found {len(silences)} silence intervals", file=sys.stderr)
 
-            # Step 3: Detect fillers (via DashScope ASR first for filler detection)
-            print("\nDetecting filler words...", file=sys.stderr)
-            # Use a simple approach: transcribe with Whisper and detect fillers
-            run_step("Whisper Transcribe (for filler detection)", [
+            # Step 3: Detect fillers (用 tiny 模型，速度快，填充词识别够用)
+            print("\nDetecting filler words (tiny model)...", file=sys.stderr)
+            filler_json = work_dir / "filler_result.json"
+            run_step("Whisper Transcribe (tiny, for filler detection)", [
                 sys.executable, "-c", f"""
 import json
 from faster_whisper import WhisperModel
-model = WhisperModel("{args.whisper_model}", device="cpu", compute_type="int8")
-segments, info = model.transcribe("{audio_wav}", language="{args.language}", word_timestamps=True, vad_filter=True)
+model = WhisperModel("tiny", device="cpu", compute_type="int8")
+segments, info = model.transcribe("{audio_wav}", language="{args.language}", word_timestamps=True, vad_filter=False)
 result = {{"segments": []}}
 for seg in segments:
     s = {{"start": seg.start, "end": seg.end, "text": seg.text, "words": []}}
     for w in seg.words or []:
         s["words"].append({{"start": w.start, "end": w.end, "word": w.word}})
     result["segments"].append(s)
-with open("{whisper_json}", "w") as f:
+with open("{filler_json}", "w") as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
 """
             ], capture_output=True)
 
             # Detect fillers from Whisper output
             result = subprocess.run(
-                [sys.executable, str(SCRIPT_DIR / "detect_fillers.py"), str(whisper_json), "whisper"],
+                [sys.executable, str(SCRIPT_DIR / "detect_fillers.py"), str(filler_json), "whisper"],
                 capture_output=True, text=True
             )
             fillers = json.loads(result.stdout) if result.stdout.strip() else []
@@ -133,14 +164,53 @@ print(f"Segments: {{len(result['segments'])}}")
 """
         ], capture_output=True)
 
-        # Step 6: Generate SRT (using word-level timestamps for precision)
+        # Step 6: Fix transcript with API (optional, degrades gracefully)
+        model_name = resolve_model()
+        if model_name:
+            print("\nFixing transcript with API...", file=sys.stderr)
+            try:
+                import anthropic
+                client = anthropic.Anthropic(
+                    api_key=os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"),
+                    base_url=os.environ.get("ANTHROPIC_BASE_URL"),
+                )
+                with open(whisper_json) as f:
+                    whisper_data = json.load(f)
+                segs = whisper_data["segments"]
+                system = """你是字幕修正助手。修正技术名词错误、不通顺表达、残留填充词。
+不要改变语义，不要添加内容，不要改变时间戳。每段一行，保持原顺序，不要加编号。"""
+                batch_size = 20
+                for i in range(0, len(segs), batch_size):
+                    batch = segs[i:i+batch_size]
+                    lines = [f"[{i+j+1}] {s['text']}" for j, s in enumerate(batch)]
+                    try:
+                        resp = client.messages.create(
+                            model=model_name, max_tokens=4096, system=system,
+                            messages=[{"role": "user", "content": "\n".join(lines)}]
+                        )
+                        result = resp.content[0].text.strip().split("\n")
+                        for k, s in enumerate(batch):
+                            if k < len(result):
+                                corrected = re.sub(r'^\[\d+\]\s*', '', result[k].strip())
+                                corrected = re.sub(r'^\d+\.\s*', '', corrected)
+                                if corrected:
+                                    s['text'] = corrected
+                    except Exception as e:
+                        print(f"  ⚠️  Batch {i//batch_size+1} failed: {e}", file=sys.stderr)
+                with open(whisper_json, "w") as f:
+                    json.dump(whisper_data, f, ensure_ascii=False, indent=2)
+                print(f"  Fixed {len(segs)} segments", file=sys.stderr)
+            except Exception as e:
+                print(f"  ⚠️  API fix skipped: {e}", file=sys.stderr)
+
+        # Step 7: Generate SRT (using word-level timestamps for precision)
         run_step("Generate SRT", [
             sys.executable, str(SCRIPT_DIR / "generate_srt.py"),
             str(whisper_json), str(srt_file),
             "--source", "whisper",
         ])
 
-        # Step 7: Burn subtitles
+        # Step 8: Burn subtitles
         run_step("Burn Subtitles", [
             sys.executable, str(SCRIPT_DIR / "burn_subtitles.py"),
             str(compacted), str(srt_file), str(output_path),
@@ -153,14 +223,13 @@ print(f"Segments: {{len(result['segments'])}}")
         print(f"{'='*50}", file=sys.stderr)
 
     finally:
-        # Cleanup temp files
-        for f in [audio_wav, whisper_json, srt_file]:
+        # Cleanup temp files (保留 compacted.mp4 和 subtitles.srt 供用户复用)
+        for f in [audio_wav, whisper_json]:
             if f.exists() and not args.compacted:
                 f.unlink()
-        # Keep compacted video if it was provided
-        if not args.compacted and compacted.exists():
-            compacted.unlink()
-        # Cleanup fillers json
+        filler_json = work_dir / "filler_result.json"
+        if filler_json.exists():
+            filler_json.unlink()
         fillers_json = work_dir / "_fillers.json"
         if fillers_json.exists():
             fillers_json.unlink()
