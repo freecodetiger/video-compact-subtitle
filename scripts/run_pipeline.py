@@ -34,10 +34,15 @@ def main():
     parser.add_argument("--whisper-model", default="medium", help="Whisper model size")
     parser.add_argument("--silence-threshold", default="-30dB", help="Silence detection threshold")
     parser.add_argument("--min-silence", type=float, default=0.3, help="Min silence duration")
+    parser.add_argument("--merge-gap", type=float, default=0.5, help="Merge nearby kept speech gaps to reduce risky cuts")
+    parser.add_argument("--max-segments", type=int, default=80, help="Maximum kept speech segments before coalescing")
+    parser.add_argument("--pre-roll", type=float, default=0.08, help="Seconds to retain before each speech interval")
+    parser.add_argument("--post-roll", type=float, default=0.12, help="Seconds to retain after each speech interval")
     parser.add_argument("--font-size", type=int, default=18, help="Subtitle font size")
     parser.add_argument("--style", default="box", choices=["box", "outline", "minimal"], help="Subtitle style")
     parser.add_argument("--skip-compact", action="store_true", help="Skip compacting, only add subtitles")
     parser.add_argument("--compacted", help="Use existing compacted video")
+    parser.add_argument("--keep-artifacts", action="store_true", help="Keep intermediate audio, transcript, SRT, and compacted master for debugging")
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -47,7 +52,16 @@ def main():
 
     # Temp files
     audio_wav = work_dir / "audio.wav"
-    compacted = Path(args.compacted).resolve() if args.compacted else work_dir / "compacted.mp4"
+    compacted_audio_wav = work_dir / "compacted_audio.wav"
+    if args.compacted:
+        compacted = Path(args.compacted).resolve()
+        created_compacted = False
+    elif args.skip_compact:
+        compacted = input_path
+        created_compacted = False
+    else:
+        compacted = work_dir / "compacted.mp4"
+        created_compacted = True
     whisper_json = work_dir / "whisper_result.json"
     srt_file = input_path.parent / "subtitles.srt"  # SRT 保留在输入目录方便用户查看
 
@@ -108,10 +122,20 @@ with open("{filler_json}", "w") as f:
                 f"--silence-threshold={args.silence_threshold}",
                 f"--min-silence={args.min_silence}",
                 "--fillers-json", str(fillers_json),
+                f"--merge-gap={args.merge_gap}",
+                f"--max-segments={args.max_segments}",
+                f"--pre-roll={args.pre_roll}",
+                f"--post-roll={args.post_roll}",
             ])
 
-        # Step 5: Re-transcribe compacted video with Whisper
-        print("\nTranscribing compacted video...", file=sys.stderr)
+        # Step 5: Re-transcribe compacted audio with Whisper.
+        # Use the final compacted audio timeline and keep VAD off to avoid hidden remapping.
+        run_step("Extract Compacted Audio", [
+            "ffmpeg", "-i", str(compacted), "-vn", "-acodec", "pcm_s16le",
+            "-ar", "16000", "-ac", "1", str(compacted_audio_wav), "-y"
+        ], capture_output=True)
+
+        print("\nTranscribing compacted audio...", file=sys.stderr)
         prompt = args.prompt or "Claude Code, CCSwitch, DeepSeek, VS Code, API Key, Kimi, MiniMax"
         run_step("Whisper Transcribe (compacted)", [
             sys.executable, "-c", f"""
@@ -119,8 +143,8 @@ import json
 from faster_whisper import WhisperModel
 model = WhisperModel("{args.whisper_model}", device="cpu", compute_type="int8")
 segments, info = model.transcribe(
-    "{compacted}", language="{args.language}", beam_size=5,
-    word_timestamps=True, vad_filter=True,
+    "{compacted_audio_wav}", language="{args.language}", beam_size=5,
+    word_timestamps=True, vad_filter=False,
     initial_prompt="{prompt}"
 )
 result = {{"segments": []}}
@@ -142,6 +166,9 @@ print(f"Segments: {{len(result['segments'])}}")
             sys.executable, str(SCRIPT_DIR / "generate_srt.py"),
             str(whisper_json), str(srt_file),
             "--source", "whisper",
+            "--max-line-chars", "18",
+            "--max-duration", "3.5",
+            "--start-offset", "0.02",
         ])
 
         # Step 7: Burn subtitles
@@ -158,8 +185,11 @@ print(f"Segments: {{len(result['segments'])}}")
 
     finally:
         # Cleanup temp files (保留 compacted.mp4 和 subtitles.srt 供用户复用)
-        for f in [audio_wav, whisper_json]:
-            if f.exists() and not args.compacted:
+        cleanup_files = [audio_wav, compacted_audio_wav, whisper_json]
+        if created_compacted:
+            cleanup_files.append(compacted.with_suffix(".timeline.json"))
+        for f in cleanup_files:
+            if f.exists() and not args.compacted and not args.keep_artifacts:
                 f.unlink()
         filler_json = work_dir / "filler_result.json"
         if filler_json.exists():

@@ -25,16 +25,6 @@ DEFAULT_FIXES = [
     ["FindSkills", "find skill"],
     ["AskAgainForSkills", "don't ask again for skill"],
     ["Dangerously-Scape-Permissions", "dangerously-skip-permissions"],
-    ["出金率", "出现率"],
-    ["夯报了", "夯爆了"],
-    ["夯报", "夯爆"],
-    ["土龙树", "图灵树"],
-    ["鸡蛋机", "计算机"],
-    ["浅严", "前沿"],
-    ["分布室", "分布式"],
-    ["调单学生", "刁难学生"],
-    ["Vab", "Web"],
-    ["拉丸", "拉完"],
 ]
 
 FILLERS = ["嗯","啊","呃","额","哦","噢","哎","唉","哈","呵","呢","吧","呀","嘛","喂","嗨","嘿","哇"]
@@ -56,44 +46,117 @@ def filter_fillers(text):
     t = re.sub(r'[，、\s]+$', '', t)
     return t.strip()
 
-MAX_CHARS = 28  # 每条字幕最大字数
-
 def split_to_chunks(text):
-    """语义切分：按。？！切大段，内按，、切小段，兜底硬切。"""
-    # 先按句号切大段
-    big_parts = re.split(r'(?<=[。？！])', text)
+    """Split by commas/periods, merge every 2 clauses."""
+    parts = [s for s in re.split(r'(?<=[，。？！])', text) if s.strip()]
     chunks = []
-    for part in big_parts:
-        part = part.strip()
-        if not part:
-            continue
-        if len(part) <= MAX_CHARS:
-            chunks.append(part)
-            continue
-        # 大段内按逗号切
-        clauses = re.split(r'(?<=[，、])', part)
-        current = ""
-        for c in clauses:
-            c = c.strip()
-            if not c:
-                continue
-            if len(current) + len(c) <= MAX_CHARS:
-                current += c
-            else:
-                if current:
-                    chunks.append(current)
-                current = c
-        if current:
-            chunks.append(current)
-    # 兜底硬切
-    result = []
-    for c in chunks:
-        if len(c) > MAX_CHARS:
-            for i in range(0, len(c), MAX_CHARS):
-                result.append(c[i:i+MAX_CHARS])
+    i = 0
+    while i < len(parts):
+        if i + 1 < len(parts):
+            chunks.append((parts[i] + parts[i+1]).strip())
+            i += 2
         else:
-            result.append(c)
-    return [c for c in result if c]
+            chunks.append(parts[i].strip())
+            i += 1
+    return [c for c in chunks if c]
+
+def visual_len(text):
+    """Approximate rendered width: Chinese chars are full width, ASCII is narrower."""
+    total = 0
+    for ch in text:
+        if ch == " ":
+            total += 0.5
+        elif ord(ch) < 128:
+            total += 0.6
+        else:
+            total += 1
+    return total
+
+def split_two_lines(text, max_line_chars=18):
+    text = text.strip()
+    if visual_len(text) <= max_line_chars:
+        return text
+
+    best = None
+    for i in range(1, len(text)):
+        left, right = text[:i], text[i:]
+        overflow = max(visual_len(left) - max_line_chars, 0) + max(visual_len(right) - max_line_chars, 0)
+        score = overflow * 100 + abs(visual_len(left) - visual_len(right))
+        if left[-1] in "的了在和与及是":
+            score += 2
+        if best is None or score < best[0]:
+            best = (score, i)
+    i = best[1]
+    return text[:i] + "\n" + text[i:]
+
+def collect_whisper_words(data, fixes):
+    words = []
+    for seg in data.get("segments", []):
+        for w in seg.get("words", []) or []:
+            text = fix_text(w.get("word", ""), fixes).strip()
+            if not text:
+                continue
+            start = w.get("start")
+            end = w.get("end")
+            if start is None or end is None or end < start:
+                continue
+            words.append({"start": float(start), "end": float(end), "text": text})
+    return words
+
+def generate_constrained_entries(data, fixes, max_chars=30, max_line_chars=18,
+                                 max_duration=3.5, min_duration=0.7,
+                                 start_offset=0.02, end_padding=0.12,
+                                 gap_break=0.55):
+    """
+    Generate display-constrained SRT entries directly from word timestamps.
+    Starts are never moved earlier than the first word unless start_offset is negative.
+    """
+    words = collect_whisper_words(data, fixes)
+    entries = []
+    cur = []
+    last_end = None
+
+    for w in words:
+        cur_text = "".join(x["text"] for x in cur)
+        candidate = cur_text + w["text"]
+        gap = 0 if last_end is None else w["start"] - last_end
+        duration = 0 if not cur else w["end"] - cur[0]["start"]
+        should_break = False
+        if cur:
+            if visual_len(candidate) > max_chars:
+                should_break = True
+            elif duration > max_duration:
+                should_break = True
+            elif gap > gap_break and visual_len(cur_text) >= 7:
+                should_break = True
+
+        if should_break:
+            entries.append(cur)
+            cur = []
+
+        cur.append(w)
+        last_end = w["end"]
+
+    if cur:
+        entries.append(cur)
+
+    timed = []
+    for group in entries:
+        begin = group[0]["start"] + start_offset
+        end = group[-1]["end"] + end_padding
+        text = filter_fillers(fix_text("".join(w["text"] for w in group), fixes))
+        if not text:
+            continue
+        if end - begin < min_duration:
+            end = begin + min_duration
+        timed.append({"begin": begin, "end": end, "text": split_two_lines(text, max_line_chars)})
+
+    for i in range(len(timed) - 1):
+        next_begin = timed[i + 1]["begin"]
+        if timed[i]["end"] > next_begin - 0.04:
+            timed[i]["end"] = max(timed[i]["begin"] + 0.25, next_begin - 0.04)
+
+    return timed
 
 def format_srt_time(seconds):
     h = int(seconds // 3600)
@@ -142,8 +205,8 @@ def generate_from_whisper_words(data, fixes):
                 "end": w.get("end", seg["end"]),
             })
 
-        # Fix and filter text
-        fixed_text = fix_text(full_text, fixes)
+        # Fix and filter text. Prefer LLM-corrected text when the pipeline added it.
+        fixed_text = seg.get("fixed_text") or fix_text(full_text, fixes)
         filtered_text = filter_fillers(fixed_text)
 
         if not filtered_text:
@@ -182,17 +245,6 @@ def generate_from_whisper_words(data, fixes):
 
             entries.append({"begin": chunk_begin, "end": chunk_end, "text": chunk})
             pos = chunk_end_in_text
-
-    # 无间隔衔接：每条结束时间 = 下一条开始时间
-    for i in range(len(entries) - 1):
-        entries[i]["end"] = entries[i + 1]["begin"]
-    # 最后一条加 200ms 缓冲
-    if entries:
-        entries[-1]["end"] += 0.2
-    # 最小显示时间 0.25s
-    for e in entries:
-        if e["end"] - e["begin"] < 0.25:
-            e["end"] = e["begin"] + 0.25
 
     return entries
 
@@ -235,6 +287,15 @@ if __name__ == "__main__":
     parser.add_argument("--fixes", help="JSON file with text fix rules [[from, to], ...]")
     parser.add_argument("--use-word-timestamps", action="store_true", default=True,
                         help="Use word-level timestamps for precise timing (default: True)")
+    parser.add_argument("--constrained", action="store_true", default=True,
+                        help="Constrain cue length, duration, overlap, and line count (default: True)")
+    parser.add_argument("--max-chars", type=int, default=30, help="Max approximate chars per subtitle cue")
+    parser.add_argument("--max-line-chars", type=int, default=18, help="Max approximate chars per subtitle line")
+    parser.add_argument("--max-duration", type=float, default=3.5, help="Max subtitle duration in seconds")
+    parser.add_argument("--min-duration", type=float, default=0.7, help="Min subtitle duration in seconds")
+    parser.add_argument("--start-offset", type=float, default=0.02,
+                        help="Cue start offset from first word; keep non-negative to avoid early subtitles")
+    parser.add_argument("--end-padding", type=float, default=0.12, help="Cue end padding after last word")
     args = parser.parse_args()
 
     with open(args.input, "r", encoding="utf-8") as f:
@@ -245,7 +306,18 @@ if __name__ == "__main__":
         with open(args.fixes) as f:
             fixes = json.load(f)
 
-    if args.source == "whisper":
+    if args.source == "whisper" and args.constrained:
+        entries = generate_constrained_entries(
+            data,
+            fixes,
+            max_chars=args.max_chars,
+            max_line_chars=args.max_line_chars,
+            max_duration=args.max_duration,
+            min_duration=args.min_duration,
+            start_offset=args.start_offset,
+            end_padding=args.end_padding,
+        )
+    elif args.source == "whisper":
         entries = generate_from_whisper_words(data, fixes)
     else:
         entries = generate_from_dashscope(data, fixes)
